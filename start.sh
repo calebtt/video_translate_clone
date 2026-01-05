@@ -8,7 +8,7 @@ echo "=============================================="
 # ------------------------------------------------
 # 1. Pull/update code from GitHub
 # ------------------------------------------------
-REPO_URL="${REPO_URL:-https://github.com/ctdontfollowme/video-translate-clone.git}"
+REPO_URL="${REPO_URL:-https://github.com/calebtt/video_translate_clone.git}"
 CODE_DIR="/workspace/video-translate-clone"
 
 echo "[1/4] Syncing code from GitHub..."

@@ -42,7 +42,7 @@ RUN chmod +x /start.sh
 # Environment
 ENV PYTHONUNBUFFERED=1
 ENV HF_HOME=/workspace/.cache/huggingface
-ENV REPO_URL=https://github.com/ctdontfollowme/video-translate-clone.git
+ENV REPO_URL=https://github.com/calebtt/video_translate_clone.git
 
 WORKDIR /workspace
 
