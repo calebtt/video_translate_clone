@@ -12,8 +12,9 @@ Translate videos from a source language to English with **zero-shot voice clonin
 Includes:
 
 - **CLI** pipeline with staged runs (`stt` / `tts` / `overlay` / `all`)
-- **HTTP job API** (upload video → poll → download result)
-- RunPod-friendly Docker image (models on a network volume)
+- **Public HTTP job API** — upload the video **in the same request**, poll status, download result
+- **API-key auth** for RunPod / internet exposure (`X-API-Key` or `Authorization: Bearer`)
+- RunPod-friendly Docker image (models on a network volume, code pull on start)
 
 ---
 
@@ -88,7 +89,23 @@ On first boot the container prints the API key and saves it under `/workspace/.v
 |--|--|
 | Local | `http://127.0.0.1:8000` |
 | RunPod public | `https://<POD_ID>-8000.proxy.runpod.net` |
-| OpenAPI | `…/docs` |
+| OpenAPI / Swagger | `…/docs` (file picker on **POST /v1/jobs**) |
+
+### Endpoints
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `GET` | `/health` | no | Liveness / GPU flag |
+| `GET` | `/v1/models/defaults` | yes | Default model paths & MT examples |
+| `POST` | `/v1/jobs` | yes | **Create job — multipart video upload in the request** |
+| `POST` | `/v1/jobs/binary` | yes | **Create job — raw video bytes in the body** |
+| `GET` | `/v1/jobs` | yes | List jobs |
+| `GET` | `/v1/jobs/{id}` | yes | Job status / progress |
+| `GET` | `/v1/jobs/{id}/result` | yes | Download translated MP4 |
+| `GET` | `/v1/jobs/{id}/segments` | yes | Download segments JSON |
+| `DELETE` | `/v1/jobs/{id}` | yes | Delete job + artifacts |
+
+Job lifecycle: `queued` → `running` → `completed` | `failed`.
 
 ### Auth
 
@@ -104,24 +121,28 @@ or:
 Authorization: Bearer <your-key>
 ```
 
-(`Authorization: ApiKey <key>` and `?api_key=` also work.)
+Also accepted: `Authorization: ApiKey <key>` and query `?api_key=` (headers preferred).
 
 `/health` is **unauthenticated** so load balancers and RunPod checks stay simple.
 
 ### Health
 
 ```bash
-curl https://<POD_ID>-8000.proxy.runpod.net/health
-```
-
-### Create a job (upload video in the request)
-
-**Multipart (recommended)** — file field must be named `video` (or `file`):
-
-```bash
 export API="https://<POD_ID>-8000.proxy.runpod.net"
 export VTCLONE_API_KEY="..."   # from pod logs or /workspace/.vtclone_api_key
 
+curl "$API/health"
+```
+
+### Create a job — upload video **with** the request
+
+The API does **not** require a pre-staged path on the pod. Send the file in the same HTTP call.
+
+#### Multipart (recommended)
+
+Form field for the file: **`video`** (alias: **`file`**). Required text field: **`src_lang`**.
+
+```bash
 curl -X POST "$API/v1/jobs" \
   -H "X-API-Key: $VTCLONE_API_KEY" \
   -F "video=@./my_video.mp4;type=video/mp4" \
@@ -129,7 +150,13 @@ curl -X POST "$API/v1/jobs" \
   -F "mt_model=Helsinki-NLP/opus-mt-de-en"
 ```
 
-**Raw binary body** (same request carries the bytes):
+Optional form fields include `stage`, `whisper_model`, `device`, `duck_gain`, `ref_seconds`,
+`prompt_text`, `skip_existing`, `fix_overlaps`, `extend_video`, `match_duration`, `vad_filter`,
+`repo_path`, `model_path`, `tokenizer_path`.
+
+Missing file → **400** with a clear error (not a silent failure).
+
+#### Raw binary body
 
 ```bash
 curl -X POST "$API/v1/jobs/binary?src_lang=de&mt_model=Helsinki-NLP/opus-mt-de-en" \
@@ -138,13 +165,17 @@ curl -X POST "$API/v1/jobs/binary?src_lang=de&mt_model=Helsinki-NLP/opus-mt-de-e
   --data-binary @./my_video.mp4
 ```
 
-Response (`202`):
+Uploads are streamed to disk with a size cap (`VTCLONE_MAX_UPLOAD_MB`, default 2048).
+
+Response (`202 Accepted`):
 
 ```json
 {
   "id": "a1b2c3d4e5f6",
   "status": "queued",
   "src_lang": "de",
+  "mt_model": "Helsinki-NLP/opus-mt-de-en",
+  "input_video": "/workspace/jobs/.../input/input.mp4",
   ...
 }
 ```
@@ -155,8 +186,6 @@ Response (`202`):
 curl "$API/v1/jobs/a1b2c3d4e5f6" -H "X-API-Key: $VTCLONE_API_KEY"
 # or: -H "Authorization: Bearer $VTCLONE_API_KEY"
 ```
-
-Statuses: `queued` → `running` → `completed` | `failed`.
 
 ### Download result
 
@@ -288,16 +317,32 @@ Then restart the pod (or re-pull inside `/workspace/video-translate-clone`).
 
 ---
 
-## Changelog (v1.1)
+## Changelog
 
-- Job-based **HTTP API** (`/v1/jobs`)
-- Modular package (`vtclone/`)
-- **Load-once** SAEX TTS (in-process) with subprocess fallback
+### v1.1.1 — Public job API + upload-in-request
+
+**API / public hosting**
+
+- Job API on **`0.0.0.0:8000`** with RunPod proxy headers (`--proxy-headers`)
+- **Upload video in the request**: multipart `POST /v1/jobs` (`video` / `file` fields) and raw `POST /v1/jobs/binary`
+- Streamed uploads, empty-file rejection, size limit, clear **400** if file missing
+- **API-key auth** on all `/v1/*` (auto-generate + persist on volume; `X-API-Key` / Bearer / ApiKey)
+- Public `/health` only; CORS configurable; OpenAPI at `/docs`
+- Job list/status/result/segments/delete; progress fields while running
+
+**Pipeline**
+
+- Modular package `vtclone/` (STT, MT, TTS, overlay, API)
+- **Load-once** Step-Audio-EditX TTS (in-process) with subprocess fallback
 - **atempo** duration matching for better A/V alignment
-- Boolean flags fixed (`--no-fix-overlaps`, `--no-extend-video`, …)
-- Project dirs default **next to the input video**
-- Whisper **tries CUDA**, falls back to CPU
-- Safer Jupyter (token required)
-- Model download markers + huggingface-cli preferred
-- `run_manifest.json` per run
-- Correct `calebtt` image/repo names in docs
+- Boolean CLI flags fixed (`--no-fix-overlaps`, `--no-extend-video`, `--no-match-duration`, …)
+- Project dirs default **next to the input video**; `run_manifest.json` per run
+- Whisper **tries CUDA**, falls back to CPU; VAD with no-VAD retry
+- Overlay handles videos with **no audio** stream; duration check vs target length
+
+**Ops**
+
+- Safer Jupyter (token required, not empty password)
+- Model download markers + `huggingface-cli` preferred over fragile LFS-only pulls
+- `requirements.txt`; Docker exposes **8000**; docs use correct `calebtt` names
+- Unit tests: utils, auth, multipart upload, binary body upload
