@@ -50,16 +50,29 @@ docker push calebtt/video-translate-clone:v1.1
 | Expose HTTP Ports | `8000,8888` |
 | Expose TCP Ports | `22` |
 
-Optional env:
+**Public access (RunPod):** HTTP ports on the template are published via RunPod’s proxy. After the pod is running, open:
+
+```text
+https://<POD_ID>-8000.proxy.runpod.net
+```
+
+You can also use **Connect → HTTP Service [Port 8000]** in the RunPod UI. All `/v1/*` routes require an API key (see below). `/health` is public for probes.
+
+Env vars:
 
 | Env | Default | Purpose |
 |-----|---------|---------|
-| `VTCLONE_API_KEY` | (empty) | Require `X-API-Key` on API |
-| `ENABLE_API` | `1` | Start FastAPI on boot |
+| `VTCLONE_API_KEY` | auto-generated | Public API key (also written to volume) |
+| `VTCLONE_API_KEY_FILE` | `/workspace/.vtclone_api_key` | Persist key across restarts |
+| `VTCLONE_REQUIRE_API_KEY` | `1` | Enforce key on `/v1/*` (set `0` only for private nets) |
+| `VTCLONE_CORS_ORIGINS` | `*` | CORS allowlist (comma-separated) |
+| `ENABLE_API` | `1` | Start FastAPI on boot (public bind `0.0.0.0`) |
 | `ENABLE_JUPYTER` | `1` | Start JupyterLab |
 | `JUPYTER_TOKEN` | random | Jupyter auth token |
-| `VTCLONE_API_PORT` | `8000` | API port |
+| `VTCLONE_API_PORT` | `8000` | API port (must match exposed HTTP port) |
 | `VTCLONE_MAX_WORKERS` | `1` | Parallel jobs (usually 1 on one GPU) |
+
+On first boot the container prints the API key and saves it under `/workspace/.vtclone_api_key` on the network volume. Set `VTCLONE_API_KEY` in the template for a stable production key.
 
 ### 4. First launch
 
@@ -69,23 +82,45 @@ Optional env:
 
 ---
 
-## HTTP API
+## HTTP API (public)
 
-Base URL: `http://<pod-host>:8000`  
-Docs: `http://<pod-host>:8000/docs`
+| | |
+|--|--|
+| Local | `http://127.0.0.1:8000` |
+| RunPod public | `https://<POD_ID>-8000.proxy.runpod.net` |
+| OpenAPI | `…/docs` |
 
-If `VTCLONE_API_KEY` is set, send header: `X-API-Key: <key>`.
+### Auth
+
+All **`/v1/*`** routes require a key (timing-safe compare). Prefer headers:
+
+```http
+X-API-Key: <your-key>
+```
+
+or:
+
+```http
+Authorization: Bearer <your-key>
+```
+
+(`Authorization: ApiKey <key>` and `?api_key=` also work.)
+
+`/health` is **unauthenticated** so load balancers and RunPod checks stay simple.
 
 ### Health
 
 ```bash
-curl http://localhost:8000/health
+curl https://<POD_ID>-8000.proxy.runpod.net/health
 ```
 
 ### Create a job
 
 ```bash
-curl -X POST http://localhost:8000/v1/jobs \
+export API="https://<POD_ID>-8000.proxy.runpod.net"
+export VTCLONE_API_KEY="..."   # from pod logs or /workspace/.vtclone_api_key
+
+curl -X POST "$API/v1/jobs" \
   -H "X-API-Key: $VTCLONE_API_KEY" \
   -F "video=@./my_video.mp4" \
   -F "src_lang=de" \
@@ -106,8 +141,8 @@ Response (`202`):
 ### Poll status
 
 ```bash
-curl http://localhost:8000/v1/jobs/a1b2c3d4e5f6 \
-  -H "X-API-Key: $VTCLONE_API_KEY"
+curl "$API/v1/jobs/a1b2c3d4e5f6" -H "X-API-Key: $VTCLONE_API_KEY"
+# or: -H "Authorization: Bearer $VTCLONE_API_KEY"
 ```
 
 Statuses: `queued` → `running` → `completed` | `failed`.
@@ -116,7 +151,7 @@ Statuses: `queued` → `running` → `completed` | `failed`.
 
 ```bash
 curl -L -o translated.mp4 \
-  http://localhost:8000/v1/jobs/a1b2c3d4e5f6/result \
+  "$API/v1/jobs/a1b2c3d4e5f6/result" \
   -H "X-API-Key: $VTCLONE_API_KEY"
 ```
 
@@ -124,15 +159,15 @@ Segments JSON:
 
 ```bash
 curl -L -o segments.json \
-  http://localhost:8000/v1/jobs/a1b2c3d4e5f6/segments \
+  "$API/v1/jobs/a1b2c3d4e5f6/segments" \
   -H "X-API-Key: $VTCLONE_API_KEY"
 ```
 
 ### List / delete
 
 ```bash
-curl http://localhost:8000/v1/jobs -H "X-API-Key: $VTCLONE_API_KEY"
-curl -X DELETE http://localhost:8000/v1/jobs/a1b2c3d4e5f6 -H "X-API-Key: $VTCLONE_API_KEY"
+curl "$API/v1/jobs" -H "X-API-Key: $VTCLONE_API_KEY"
+curl -X DELETE "$API/v1/jobs/a1b2c3d4e5f6" -H "X-API-Key: $VTCLONE_API_KEY"
 ```
 
 ### Local API process
@@ -140,13 +175,15 @@ curl -X DELETE http://localhost:8000/v1/jobs/a1b2c3d4e5f6 -H "X-API-Key: $VTCLON
 ```bash
 export PYTHONPATH=.
 export VTCLONE_JOBS_DIR=./jobs
+export VTCLONE_API_KEY=dev-secret-change-me
+export VTCLONE_REQUIRE_API_KEY=1
 export VTCLONE_REPO_PATH=/path/to/Step-Audio-EditX
 export VTCLONE_MODEL_PATH=/path/to/models/Step-Audio-EditX
 export VTCLONE_TOKENIZER_PATH=/path/to/models/Step-Audio-Tokenizer
 
 pip install -r requirements.txt
 python api_server.py
-# or: uvicorn vtclone.api:app --host 0.0.0.0 --port 8000
+# binds 0.0.0.0:8000 — ready for reverse proxy / RunPod HTTP port
 ```
 
 ---

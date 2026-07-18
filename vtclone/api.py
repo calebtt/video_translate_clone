@@ -1,8 +1,15 @@
 """
 FastAPI job API for offline video translation + voice cloning.
 
+Designed for public exposure (e.g. RunPod HTTP proxy) with API-key auth.
+
+Auth (all /v1/* routes):
+  X-API-Key: <key>
+  Authorization: Bearer <key>
+  Authorization: ApiKey <key>
+
 Endpoints:
-  GET  /health
+  GET  /health                  public (no secrets)
   GET  /v1/models/defaults
   POST /v1/jobs                 multipart: video file + form fields
   GET  /v1/jobs                 list jobs
@@ -14,30 +21,40 @@ Endpoints:
 
 from __future__ import annotations
 
+import logging
 import os
+import secrets
 import shutil
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .pipeline import PipelineConfig, PipelineResult, run_pipeline
 from .utils import setup_logging
 
 setup_logging()
+logger = logging.getLogger("vtclone.api")
 
 # ---------------------------------------------------------------------------
 # Config from environment
 # ---------------------------------------------------------------------------
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
 
 def _default_jobs_dir() -> Path:
     if os.environ.get("VTCLONE_JOBS_DIR"):
@@ -48,8 +65,62 @@ def _default_jobs_dir() -> Path:
     return Path.cwd() / "jobs"
 
 
-API_KEY = os.environ.get("VTCLONE_API_KEY", "").strip()
+def _default_key_file() -> Path:
+    if os.environ.get("VTCLONE_API_KEY_FILE"):
+        return Path(os.environ["VTCLONE_API_KEY_FILE"]).expanduser()
+    if Path("/workspace").is_dir() and os.access("/workspace", os.W_OK):
+        return Path("/workspace/.vtclone_api_key")
+    return Path.cwd() / ".vtclone_api_key"
+
+
+def _resolve_api_key() -> str:
+    """
+    Resolve API key for public access:
+      1. VTCLONE_API_KEY env
+      2. VTCLONE_API_KEY_FILE / default key file on volume
+      3. Generate + persist if VTCLONE_REQUIRE_API_KEY (default true)
+    """
+    env_key = os.environ.get("VTCLONE_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    key_file = _default_key_file()
+    try:
+        if key_file.is_file():
+            stored = key_file.read_text(encoding="utf-8").strip()
+            if stored:
+                logger.info("Loaded API key from %s", key_file)
+                return stored
+    except OSError as e:
+        logger.warning("Could not read API key file %s: %s", key_file, e)
+
+    require = _env_bool("VTCLONE_REQUIRE_API_KEY", True)
+    if not require:
+        logger.warning(
+            "VTCLONE_REQUIRE_API_KEY=0 and no key set — /v1 routes are UNPROTECTED"
+        )
+        return ""
+
+    generated = secrets.token_urlsafe(32)
+    try:
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        key_file.write_text(generated + "\n", encoding="utf-8")
+        try:
+            key_file.chmod(0o600)
+        except OSError:
+            pass
+        logger.info("Generated API key and saved to %s", key_file)
+    except OSError as e:
+        logger.warning("Could not persist API key to %s: %s (using in-memory key)", key_file, e)
+    return generated
+
+
 JOBS_ROOT = _default_jobs_dir().resolve()
+API_KEY = _resolve_api_key()
+REQUIRE_API_KEY = _env_bool("VTCLONE_REQUIRE_API_KEY", True)
+# If a key exists, always enforce it (even when REQUIRE is false but key was set)
+AUTH_ENABLED = bool(API_KEY) or REQUIRE_API_KEY
+
 DEFAULT_REPO = Path(
     os.environ.get("VTCLONE_REPO_PATH", "/workspace/Step-Audio-EditX")
 )
@@ -63,6 +134,11 @@ DEFAULT_MT = os.environ.get("VTCLONE_MT_MODEL", "Helsinki-NLP/opus-mt-de-en")
 DEFAULT_WHISPER = os.environ.get("VTCLONE_WHISPER_MODEL", "large-v3")
 MAX_WORKERS = int(os.environ.get("VTCLONE_MAX_WORKERS", "1"))
 MAX_UPLOAD_MB = int(os.environ.get("VTCLONE_MAX_UPLOAD_MB", "2048"))
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("VTCLONE_CORS_ORIGINS", "*").split(",")
+    if o.strip()
+]
 
 try:
     JOBS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -107,11 +183,52 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> None:
-    if not API_KEY:
+def _extract_api_key(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> Optional[str]:
+    """Pull key from X-API-Key or Authorization: Bearer|ApiKey."""
+    if x_api_key and x_api_key.strip():
+        return x_api_key.strip()
+    if authorization:
+        parts = authorization.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() in ("bearer", "apikey"):
+            return parts[1].strip()
+        # bare token
+        if len(parts) == 1:
+            return parts[0].strip()
+    # Optional query param for simple clients (prefer headers in production)
+    q = request.query_params.get("api_key")
+    if q and q.strip():
+        return q.strip()
+    return None
+
+
+def _require_api_key(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> None:
+    """
+    Enforce API key when public auth is enabled.
+    /health stays open (registered without this dependency).
+    """
+    if not AUTH_ENABLED or not API_KEY:
+        if REQUIRE_API_KEY and not API_KEY:
+            raise HTTPException(
+                status_code=503,
+                detail="API key not configured; set VTCLONE_API_KEY",
+            )
         return
-    if not x_api_key or x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+
+    provided = _extract_api_key(request, x_api_key, authorization)
+    if not provided or not secrets.compare_digest(provided, API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key. Send X-API-Key or Authorization: Bearer <key>",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
 
 
 def _job_dir(job_id: str) -> Path:
@@ -149,12 +266,36 @@ _load_jobs_from_disk()
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Video Translate Clone API",
-        description="Offline video translation with voice cloning (job-based).",
+        description=(
+            "Offline video translation with voice cloning (job-based).\n\n"
+            "**Public auth:** send `X-API-Key: <key>` or "
+            "`Authorization: Bearer <key>` on all `/v1/*` routes.\n\n"
+            "On RunPod, expose HTTP port **8000** and use:\n"
+            "`https://<POD_ID>-8000.proxy.runpod.net`"
+        ),
         version="1.1.0",
     )
 
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
+
+    @app.exception_handler(HTTPException)
+    async def http_exc_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=getattr(exc, "headers", None) or {},
+        )
+
     @app.get("/health")
     def health() -> Dict[str, Any]:
+        """Public liveness probe (no auth). Does not expose the API key."""
         gpu = False
         try:
             import torch
@@ -165,9 +306,9 @@ def create_app() -> FastAPI:
         return {
             "status": "ok",
             "gpu": gpu,
-            "jobs_root": str(JOBS_ROOT),
             "max_workers": MAX_WORKERS,
-            "api_key_required": bool(API_KEY),
+            "api_key_required": bool(AUTH_ENABLED and API_KEY),
+            "public_auth": "X-API-Key or Authorization: Bearer",
         }
 
     @app.get("/v1/models/defaults")

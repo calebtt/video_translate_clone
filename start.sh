@@ -128,6 +128,32 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 fi
 df -h /workspace 2>/dev/null | tail -1 || true
 
+# ------------------------------------------------
+# 4b. Public API key (required for exposed /v1 routes)
+# ------------------------------------------------
+API_KEY_FILE="${VTCLONE_API_KEY_FILE:-/workspace/.vtclone_api_key}"
+export VTCLONE_REQUIRE_API_KEY="${VTCLONE_REQUIRE_API_KEY:-1}"
+export VTCLONE_API_KEY_FILE="$API_KEY_FILE"
+
+if [ -z "${VTCLONE_API_KEY:-}" ]; then
+    if [ -f "$API_KEY_FILE" ] && [ -s "$API_KEY_FILE" ]; then
+        export VTCLONE_API_KEY="$(tr -d '[:space:]' < "$API_KEY_FILE")"
+        echo "[auth] Loaded API key from $API_KEY_FILE"
+    else
+        export VTCLONE_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+        umask 077
+        printf '%s\n' "$VTCLONE_API_KEY" > "$API_KEY_FILE"
+        chmod 600 "$API_KEY_FILE" 2>/dev/null || true
+        echo "[auth] Generated new API key -> $API_KEY_FILE"
+    fi
+else
+    # Persist env-provided key so restarts stay consistent
+    umask 077
+    printf '%s\n' "$VTCLONE_API_KEY" > "$API_KEY_FILE"
+    chmod 600 "$API_KEY_FILE" 2>/dev/null || true
+    echo "[auth] Using VTCLONE_API_KEY from environment (saved to $API_KEY_FILE)"
+fi
+
 echo ""
 echo "=============================================="
 echo "Ready."
@@ -142,9 +168,18 @@ echo "    --repo_path $SAEX_DIR \\"
 echo "    --model_path $MODELS_DIR/Step-Audio-EditX \\"
 echo "    --tokenizer_path $MODELS_DIR/Step-Audio-Tokenizer"
 echo ""
-echo "API (port $API_PORT):"
-echo "  curl http://localhost:${API_PORT}/health"
-echo "  # OpenAPI docs: http://<pod-ip>:${API_PORT}/docs"
+echo "PUBLIC API (bind 0.0.0.0:${API_PORT}):"
+echo "  Auth header:  X-API-Key: ${VTCLONE_API_KEY}"
+echo "  Or:           Authorization: Bearer ${VTCLONE_API_KEY}"
+echo "  Key file:     ${API_KEY_FILE}"
+echo "  Health:       curl http://127.0.0.1:${API_PORT}/health"
+echo "  RunPod proxy: https://<POD_ID>-${API_PORT}.proxy.runpod.net"
+echo "  Docs:         https://<POD_ID>-${API_PORT}.proxy.runpod.net/docs"
+echo "  Example job:"
+echo "    curl -X POST \"https://<POD_ID>-${API_PORT}.proxy.runpod.net/v1/jobs\" \\"
+echo "      -H \"X-API-Key: ${VTCLONE_API_KEY}\" \\"
+echo "      -F \"video=@./clip.mp4\" -F \"src_lang=de\" \\"
+echo "      -F \"mt_model=Helsinki-NLP/opus-mt-de-en\""
 echo "=============================================="
 
 # ------------------------------------------------
@@ -154,10 +189,24 @@ echo "[5/5] Starting services..."
 
 API_PID=""
 if [ "$ENABLE_API" = "1" ]; then
-    echo "  Starting API on 0.0.0.0:${API_PORT}..."
+    echo "  Starting public API on 0.0.0.0:${API_PORT}..."
     cd "$CODE_DIR"
     # nohup so the API survives shell exec → jupyter
-    nohup python -m uvicorn vtclone.api:app --host 0.0.0.0 --port "$API_PORT" --log-level info \
+    # --proxy-headers: trust RunPod/edge X-Forwarded-* when behind HTTPS proxy
+    nohup env \
+        VTCLONE_API_KEY="$VTCLONE_API_KEY" \
+        VTCLONE_REQUIRE_API_KEY="$VTCLONE_REQUIRE_API_KEY" \
+        VTCLONE_API_KEY_FILE="$API_KEY_FILE" \
+        VTCLONE_JOBS_DIR="$JOBS_DIR" \
+        VTCLONE_REPO_PATH="$SAEX_DIR" \
+        VTCLONE_MODEL_PATH="$MODELS_DIR/Step-Audio-EditX" \
+        VTCLONE_TOKENIZER_PATH="$MODELS_DIR/Step-Audio-Tokenizer" \
+        python -m uvicorn vtclone.api:app \
+            --host 0.0.0.0 \
+            --port "$API_PORT" \
+            --proxy-headers \
+            --forwarded-allow-ips='*' \
+            --log-level info \
         > /workspace/api.log 2>&1 &
     API_PID=$!
     disown "$API_PID" 2>/dev/null || true

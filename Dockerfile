@@ -32,6 +32,8 @@ ENV VTCLONE_REPO_PATH=/workspace/Step-Audio-EditX
 ENV VTCLONE_MODEL_PATH=/workspace/models/Step-Audio-EditX
 ENV VTCLONE_TOKENIZER_PATH=/workspace/models/Step-Audio-Tokenizer
 ENV VTCLONE_API_PORT=8000
+ENV VTCLONE_REQUIRE_API_KEY=1
+ENV VTCLONE_API_KEY_FILE=/workspace/.vtclone_api_key
 ENV JUPYTER_TOKEN=
 
 WORKDIR /workspace

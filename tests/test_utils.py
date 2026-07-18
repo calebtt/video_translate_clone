@@ -75,10 +75,43 @@ def test_cli_help():
 
 
 def test_api_import():
-    from vtclone.api import app, create_app
+    from vtclone.api import create_app
 
     a = create_app()
     assert a.title
     routes = {getattr(r, "path", None) for r in a.routes}
     assert "/health" in routes
     assert "/v1/jobs" in routes
+
+
+def test_public_api_key_auth(tmp_path, monkeypatch):
+    """Unauthenticated /v1 fails; X-API-Key and Bearer work; /health is open."""
+    import importlib
+
+    import vtclone.api as api_mod
+
+    key_file = tmp_path / "key"
+    key_file.write_text("test-secret-key-xyz\n", encoding="utf-8")
+    monkeypatch.setenv("VTCLONE_API_KEY", "test-secret-key-xyz")
+    monkeypatch.setenv("VTCLONE_REQUIRE_API_KEY", "1")
+    monkeypatch.setenv("VTCLONE_API_KEY_FILE", str(key_file))
+    monkeypatch.setenv("VTCLONE_JOBS_DIR", str(tmp_path / "jobs"))
+
+    importlib.reload(api_mod)
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_mod.create_app())
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/v1/jobs").status_code == 401
+    assert client.get("/v1/jobs", headers={"X-API-Key": "wrong"}).status_code == 401
+    assert (
+        client.get("/v1/jobs", headers={"X-API-Key": "test-secret-key-xyz"}).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            "/v1/jobs", headers={"Authorization": "Bearer test-secret-key-xyz"}
+        ).status_code
+        == 200
+    )
