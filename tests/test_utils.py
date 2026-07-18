@@ -84,20 +84,23 @@ def test_api_import():
     assert "/v1/jobs" in routes
 
 
-def test_public_api_key_auth(tmp_path, monkeypatch):
-    """Unauthenticated /v1 fails; X-API-Key and Bearer work; /health is open."""
+def _reload_api(tmp_path, monkeypatch, key: str = "test-secret-key-xyz"):
     import importlib
 
     import vtclone.api as api_mod
 
     key_file = tmp_path / "key"
-    key_file.write_text("test-secret-key-xyz\n", encoding="utf-8")
-    monkeypatch.setenv("VTCLONE_API_KEY", "test-secret-key-xyz")
+    key_file.write_text(key + "\n", encoding="utf-8")
+    monkeypatch.setenv("VTCLONE_API_KEY", key)
     monkeypatch.setenv("VTCLONE_REQUIRE_API_KEY", "1")
     monkeypatch.setenv("VTCLONE_API_KEY_FILE", str(key_file))
     monkeypatch.setenv("VTCLONE_JOBS_DIR", str(tmp_path / "jobs"))
+    return importlib.reload(api_mod)
 
-    importlib.reload(api_mod)
+
+def test_public_api_key_auth(tmp_path, monkeypatch):
+    """Unauthenticated /v1 fails; X-API-Key and Bearer work; /health is open."""
+    api_mod = _reload_api(tmp_path, monkeypatch)
     from fastapi.testclient import TestClient
 
     client = TestClient(api_mod.create_app())
@@ -115,3 +118,86 @@ def test_public_api_key_auth(tmp_path, monkeypatch):
         ).status_code
         == 200
     )
+
+
+def test_multipart_video_upload_with_request(tmp_path, monkeypatch):
+    """POST /v1/jobs must accept the video file in the same multipart request."""
+    api_mod = _reload_api(tmp_path, monkeypatch)
+
+    def fake_run(cfg, progress=None):
+        from vtclone.pipeline import PipelineResult
+
+        out = Path(cfg.project_dir) / "translated.mp4"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake-video")
+        segs = Path(cfg.project_dir) / "segments.json"
+        segs.write_text('{"segments":[]}', encoding="utf-8")
+        return PipelineResult(
+            success=True,
+            output_video=str(out),
+            output_json=str(segs),
+            project_dir=str(cfg.project_dir),
+            stages_run=["all"],
+            elapsed_sec=0.01,
+        )
+
+    api_mod.run_pipeline = fake_run
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_mod.create_app())
+    headers = {"X-API-Key": "test-secret-key-xyz"}
+    payload = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64
+
+    # Missing file → 400
+    r = client.post(
+        "/v1/jobs",
+        headers=headers,
+        data={"src_lang": "de", "mt_model": "Helsinki-NLP/opus-mt-de-en"},
+    )
+    assert r.status_code == 400
+    assert "video" in r.json()["detail"].lower()
+
+    # Field name video
+    r = client.post(
+        "/v1/jobs",
+        headers=headers,
+        files={"video": ("clip.mp4", payload, "video/mp4")},
+        data={"src_lang": "de", "mt_model": "Helsinki-NLP/opus-mt-de-en"},
+    )
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["status"] in ("queued", "running", "completed")
+    assert Path(body["input_video"]).is_file()
+    assert Path(body["input_video"]).read_bytes() == payload
+
+    # Alias field name file
+    r = client.post(
+        "/v1/jobs",
+        headers=headers,
+        files={"file": ("other.mov", payload, "video/quicktime")},
+        data={"src_lang": "ru"},
+    )
+    assert r.status_code == 202, r.text
+
+
+def test_binary_body_video_upload(tmp_path, monkeypatch):
+    api_mod = _reload_api(tmp_path, monkeypatch)
+    api_mod.run_pipeline = lambda cfg, progress=None: __import__(
+        "vtclone.pipeline", fromlist=["PipelineResult"]
+    ).PipelineResult(success=True, stages_run=[], elapsed_sec=0.0)
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_mod.create_app())
+    payload = b"\x00\x00\x00\x18ftypmp42" + b"\x11" * 32
+    r = client.post(
+        "/v1/jobs/binary",
+        params={"src_lang": "de", "mt_model": "Helsinki-NLP/opus-mt-de-en"},
+        headers={
+            "X-API-Key": "test-secret-key-xyz",
+            "Content-Type": "video/mp4",
+        },
+        content=payload,
+    )
+    assert r.status_code == 202, r.text
+    assert Path(r.json()["input_video"]).read_bytes() == payload

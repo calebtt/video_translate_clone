@@ -34,7 +34,17 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -262,18 +272,161 @@ def _load_jobs_from_disk() -> None:
 
 _load_jobs_from_disk()
 
+# Common video extensions we accept on upload
+_VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".mpeg", ".mpg", ".ts"}
+
+
+def _suffix_from_name(name: str) -> str:
+    suf = Path(name).suffix.lower()
+    return suf if suf in _VIDEO_SUFFIXES else ".mp4"
+
+
+def _suffix_from_content_type(content_type: Optional[str]) -> str:
+    if not content_type:
+        return ".mp4"
+    ct = content_type.split(";")[0].strip().lower()
+    return {
+        "video/mp4": ".mp4",
+        "video/webm": ".webm",
+        "video/quicktime": ".mov",
+        "video/x-matroska": ".mkv",
+        "video/x-msvideo": ".avi",
+        "application/octet-stream": ".mp4",
+    }.get(ct, ".mp4")
+
+
+async def _stream_upload_to_path(upload: UploadFile, dest: Path, max_bytes: int) -> int:
+    """Write an UploadFile to disk; return size. Raises HTTPException on limits/empty."""
+    size = 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("wb") as f:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                f.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(413, f"Upload exceeds {MAX_UPLOAD_MB} MB")
+            f.write(chunk)
+    if size == 0:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, "Uploaded video is empty")
+    return size
+
+
+async def _stream_body_to_path(request: Request, dest: Path, max_bytes: int) -> int:
+    size = 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("wb") as f:
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            size += len(chunk)
+            if size > max_bytes:
+                f.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(413, f"Upload exceeds {MAX_UPLOAD_MB} MB")
+            f.write(chunk)
+    if size == 0:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(
+            400,
+            "Empty body. Send the video as multipart field 'video' or as raw binary body.",
+        )
+    return size
+
+
+def _enqueue_job(
+    *,
+    dest: Path,
+    size: int,
+    orig_name: str,
+    src_lang: str,
+    mt_model: str,
+    stage: str,
+    whisper_model: str,
+    device: str,
+    compute_type: str,
+    duck_gain: float,
+    ref_seconds: float,
+    prompt_text: Optional[str],
+    skip_existing: bool,
+    fix_overlaps: bool,
+    extend_video: bool,
+    match_duration: bool,
+    vad_filter: bool,
+    repo_path: Optional[str],
+    model_path: Optional[str],
+    tokenizer_path: Optional[str],
+) -> JobRecord:
+    if stage not in ("stt", "tts", "overlay", "all"):
+        raise HTTPException(400, f"Invalid stage: {stage}")
+    if not src_lang or not src_lang.strip():
+        raise HTTPException(400, "src_lang is required")
+
+    job_id = uuid.uuid4().hex[:12]
+    # Move into job-scoped directory
+    jdir = _job_dir(job_id)
+    input_dir = jdir / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    final_path = input_dir / f"input{_suffix_from_name(orig_name)}"
+    if dest.resolve() != final_path.resolve():
+        shutil.move(str(dest), str(final_path))
+        dest = final_path
+
+    now = _now()
+    rec = JobRecord(
+        id=job_id,
+        status=JobStatus.queued,
+        created_at=now,
+        updated_at=now,
+        src_lang=src_lang.strip(),
+        mt_model=mt_model,
+        stage=stage,
+        input_video=str(dest),
+        params={
+            "whisper_model": whisper_model,
+            "device": device,
+            "compute_type": compute_type,
+            "duck_gain": duck_gain,
+            "ref_seconds": ref_seconds,
+            "prompt_text": prompt_text,
+            "skip_existing": skip_existing,
+            "fix_overlaps": fix_overlaps,
+            "extend_video": extend_video,
+            "match_duration": match_duration,
+            "vad_filter": vad_filter,
+            "repo_path": repo_path or str(DEFAULT_REPO),
+            "model_path": model_path or str(DEFAULT_MODEL),
+            "tokenizer_path": tokenizer_path or str(DEFAULT_TOKENIZER),
+            "original_filename": orig_name,
+            "upload_bytes": size,
+        },
+    )
+    with _lock:
+        _jobs[job_id] = rec
+    _save_job(rec)
+    _executor.submit(_run_job, job_id)
+    return rec
+
 
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Video Translate Clone API",
         description=(
             "Offline video translation with voice cloning (job-based).\n\n"
+            "**Upload a video with the request** (required):\n"
+            "- `POST /v1/jobs` as `multipart/form-data` with file field **`video`** "
+            "(alias: `file`), plus form fields like `src_lang`.\n"
+            "- `POST /v1/jobs/binary` with raw video bytes in the body and query params.\n\n"
             "**Public auth:** send `X-API-Key: <key>` or "
             "`Authorization: Bearer <key>` on all `/v1/*` routes.\n\n"
             "On RunPod, expose HTTP port **8000** and use:\n"
             "`https://<POD_ID>-8000.proxy.runpod.net`"
         ),
-        version="1.1.0",
+        version="1.1.1",
     )
 
     app.add_middleware(
@@ -334,11 +487,26 @@ def create_app() -> FastAPI:
         with _lock:
             return sorted(_jobs.values(), key=lambda j: j.created_at, reverse=True)
 
-    @app.post("/v1/jobs", response_model=JobRecord, status_code=202)
+    @app.post(
+        "/v1/jobs",
+        response_model=JobRecord,
+        status_code=202,
+        summary="Create job (multipart video upload)",
+        response_description="Job accepted and queued",
+    )
     async def create_job(
-        video: UploadFile = File(..., description="Input video file"),
-        src_lang: str = Form(..., description="Source language code, e.g. de"),
-        mt_model: str = Form(DEFAULT_MT),
+        video: Optional[UploadFile] = File(
+            default=None,
+            description="Video file to translate (multipart field name: video)",
+            media_type="video/*",
+        ),
+        file: Optional[UploadFile] = File(
+            default=None,
+            description="Alias for video (multipart field name: file)",
+            media_type="video/*",
+        ),
+        src_lang: str = Form(..., description="Source language code, e.g. de", examples=["de"]),
+        mt_model: str = Form(DEFAULT_MT, description="HuggingFace translation model id"),
         stage: str = Form("all"),
         whisper_model: str = Form(DEFAULT_WHISPER),
         device: str = Form("cuda"),
@@ -356,70 +524,167 @@ def create_app() -> FastAPI:
         tokenizer_path: Optional[str] = Form(None),
         _: None = Depends(_require_api_key),
     ) -> JobRecord:
-        if stage not in ("stt", "tts", "overlay", "all"):
-            raise HTTPException(400, f"Invalid stage: {stage}")
+        """
+        **Upload the video in this request** as `multipart/form-data`.
 
-        job_id = uuid.uuid4().hex[:12]
-        jdir = _job_dir(job_id)
-        jdir.mkdir(parents=True, exist_ok=True)
-        input_dir = jdir / "input"
-        input_dir.mkdir(exist_ok=True)
+        Required parts:
+        - **`video`** (file) — or alias **`file`**
+        - **`src_lang`** (text) — e.g. `de`, `ru`
 
-        # Preserve extension when possible
-        orig_name = video.filename or "input.mp4"
-        suffix = Path(orig_name).suffix or ".mp4"
-        safe_name = f"input{suffix}"
-        dest = input_dir / safe_name
+        Example:
+        ```bash
+        curl -X POST \"$API/v1/jobs\" \\\\
+          -H \"X-API-Key: $KEY\" \\\\
+          -F \"video=@./my_clip.mp4;type=video/mp4\" \\\\
+          -F \"src_lang=de\" \\\\
+          -F \"mt_model=Helsinki-NLP/opus-mt-de-en\"
+        ```
+        """
+        upload = video or file
+        if upload is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Missing video upload. Send multipart/form-data with a file field "
+                    "named 'video' (or 'file'), e.g. "
+                    "curl -F 'video=@clip.mp4' -F 'src_lang=de' ..."
+                ),
+            )
 
-        size = 0
+        # Reject clearly non-file empty placeholders
+        orig_name = upload.filename or "input.mp4"
+        if not orig_name or orig_name == "string":
+            orig_name = "input.mp4"
+
+        staging = JOBS_ROOT / "_staging" / uuid.uuid4().hex
+        staging.mkdir(parents=True, exist_ok=True)
+        dest = staging / f"upload{_suffix_from_name(orig_name)}"
         max_bytes = MAX_UPLOAD_MB * 1024 * 1024
-        with dest.open("wb") as f:
-            while True:
-                chunk = await video.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > max_bytes:
-                    f.close()
-                    shutil.rmtree(jdir, ignore_errors=True)
-                    raise HTTPException(413, f"Upload exceeds {MAX_UPLOAD_MB} MB")
-                f.write(chunk)
+        try:
+            size = await _stream_upload_to_path(upload, dest, max_bytes)
+        except HTTPException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        except Exception as e:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise HTTPException(400, f"Failed to read uploaded video: {e}") from e
+        finally:
+            try:
+                await upload.close()
+            except Exception:
+                pass
 
-        now = _now()
-        rec = JobRecord(
-            id=job_id,
-            status=JobStatus.queued,
-            created_at=now,
-            updated_at=now,
-            src_lang=src_lang,
-            mt_model=mt_model,
-            stage=stage,
-            input_video=str(dest),
-            params={
-                "whisper_model": whisper_model,
-                "device": device,
-                "compute_type": compute_type,
-                "duck_gain": duck_gain,
-                "ref_seconds": ref_seconds,
-                "prompt_text": prompt_text,
-                "skip_existing": skip_existing,
-                "fix_overlaps": fix_overlaps,
-                "extend_video": extend_video,
-                "match_duration": match_duration,
-                "vad_filter": vad_filter,
-                "repo_path": repo_path or str(DEFAULT_REPO),
-                "model_path": model_path or str(DEFAULT_MODEL),
-                "tokenizer_path": tokenizer_path or str(DEFAULT_TOKENIZER),
-                "original_filename": orig_name,
-                "upload_bytes": size,
-            },
-        )
-        with _lock:
-            _jobs[job_id] = rec
-        _save_job(rec)
+        try:
+            return _enqueue_job(
+                dest=dest,
+                size=size,
+                orig_name=orig_name,
+                src_lang=src_lang,
+                mt_model=mt_model,
+                stage=stage,
+                whisper_model=whisper_model,
+                device=device,
+                compute_type=compute_type,
+                duck_gain=duck_gain,
+                ref_seconds=ref_seconds,
+                prompt_text=prompt_text,
+                skip_existing=skip_existing,
+                fix_overlaps=fix_overlaps,
+                extend_video=extend_video,
+                match_duration=match_duration,
+                vad_filter=vad_filter,
+                repo_path=repo_path,
+                model_path=model_path,
+                tokenizer_path=tokenizer_path,
+            )
+        except HTTPException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
 
-        _executor.submit(_run_job, job_id)
-        return rec
+    @app.post(
+        "/v1/jobs/binary",
+        response_model=JobRecord,
+        status_code=202,
+        summary="Create job (raw video body upload)",
+        response_description="Job accepted and queued",
+    )
+    async def create_job_binary(
+        request: Request,
+        src_lang: str = Query(..., description="Source language code, e.g. de"),
+        mt_model: str = Query(DEFAULT_MT),
+        stage: str = Query("all"),
+        whisper_model: str = Query(DEFAULT_WHISPER),
+        device: str = Query("cuda"),
+        compute_type: str = Query("float16"),
+        duck_gain: float = Query(0.15),
+        ref_seconds: float = Query(10.0),
+        prompt_text: Optional[str] = Query(None),
+        filename: Optional[str] = Query(
+            None, description="Original filename for extension (default input.mp4)"
+        ),
+        _: None = Depends(_require_api_key),
+    ) -> JobRecord:
+        """
+        Upload the video as the **raw HTTP body** (not multipart).
+
+        ```bash
+        curl -X POST \"$API/v1/jobs/binary?src_lang=de&mt_model=Helsinki-NLP/opus-mt-de-en\" \\\\
+          -H \"X-API-Key: $KEY\" \\\\
+          -H \"Content-Type: video/mp4\" \\\\
+          --data-binary @./my_clip.mp4
+        ```
+        """
+        content_type = request.headers.get("content-type", "")
+        if content_type.lower().startswith("multipart/"):
+            raise HTTPException(
+                415,
+                "This endpoint expects a raw video body. "
+                "For multipart uploads use POST /v1/jobs with field 'video'.",
+            )
+
+        orig_name = filename or f"input{_suffix_from_content_type(content_type)}"
+        staging = JOBS_ROOT / "_staging" / uuid.uuid4().hex
+        staging.mkdir(parents=True, exist_ok=True)
+        dest = staging / f"upload{_suffix_from_name(orig_name)}"
+        max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+        try:
+            size = await _stream_body_to_path(request, dest, max_bytes)
+        except HTTPException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+        try:
+            return _enqueue_job(
+                dest=dest,
+                size=size,
+                orig_name=orig_name,
+                src_lang=src_lang,
+                mt_model=mt_model,
+                stage=stage,
+                whisper_model=whisper_model,
+                device=device,
+                compute_type=compute_type,
+                duck_gain=duck_gain,
+                ref_seconds=ref_seconds,
+                prompt_text=prompt_text,
+                skip_existing=False,
+                fix_overlaps=True,
+                extend_video=True,
+                match_duration=True,
+                vad_filter=True,
+                repo_path=None,
+                model_path=None,
+                tokenizer_path=None,
+            )
+        except HTTPException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
 
     @app.get("/v1/jobs/{job_id}", response_model=JobRecord)
     def get_job(job_id: str, _: None = Depends(_require_api_key)) -> JobRecord:

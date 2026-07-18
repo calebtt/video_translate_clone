@@ -114,7 +114,9 @@ Authorization: Bearer <your-key>
 curl https://<POD_ID>-8000.proxy.runpod.net/health
 ```
 
-### Create a job
+### Create a job (upload video in the request)
+
+**Multipart (recommended)** — file field must be named `video` (or `file`):
 
 ```bash
 export API="https://<POD_ID>-8000.proxy.runpod.net"
@@ -122,9 +124,18 @@ export VTCLONE_API_KEY="..."   # from pod logs or /workspace/.vtclone_api_key
 
 curl -X POST "$API/v1/jobs" \
   -H "X-API-Key: $VTCLONE_API_KEY" \
-  -F "video=@./my_video.mp4" \
+  -F "video=@./my_video.mp4;type=video/mp4" \
   -F "src_lang=de" \
   -F "mt_model=Helsinki-NLP/opus-mt-de-en"
+```
+
+**Raw binary body** (same request carries the bytes):
+
+```bash
+curl -X POST "$API/v1/jobs/binary?src_lang=de&mt_model=Helsinki-NLP/opus-mt-de-en" \
+  -H "X-API-Key: $VTCLONE_API_KEY" \
+  -H "Content-Type: video/mp4" \
+  --data-binary @./my_video.mp4
 ```
 
 Response (`202`):
