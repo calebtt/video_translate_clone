@@ -201,3 +201,101 @@ def test_binary_body_video_upload(tmp_path, monkeypatch):
     )
     assert r.status_code == 202, r.text
     assert Path(r.json()["input_video"]).read_bytes() == payload
+
+
+def test_websocket_auth_subscribe_and_submit(tmp_path, monkeypatch):
+    """WS /v1/ws: auth, subscribe, submit binary, receive job_queued."""
+    import time
+
+    api_mod = _reload_api(tmp_path, monkeypatch)
+
+    def fake_run(cfg, progress=None):
+        from vtclone.pipeline import PipelineResult
+
+        if progress:
+            progress("stt_start", {})
+            progress("overlay_done", {"output": "x"})
+        out = Path(cfg.project_dir) / "translated.mp4"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"out")
+        segs = Path(cfg.project_dir) / "segments.json"
+        segs.write_text('{"segments":[]}', encoding="utf-8")
+        return PipelineResult(
+            success=True,
+            output_video=str(out),
+            output_json=str(segs),
+            project_dir=str(cfg.project_dir),
+            stages_run=["all"],
+            elapsed_sec=0.05,
+        )
+
+    api_mod.run_pipeline = fake_run
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_mod.create_app())
+    key = "test-secret-key-xyz"
+    payload = b"\x00\x00\x00\x18ftypmp42" + b"\x22" * 48
+
+    with client.websocket_connect(f"/v1/ws?api_key={key}") as ws:
+        hello = ws.receive_json()
+        assert hello["type"] == "hello"
+        assert hello["authenticated"] is True
+
+        ws.send_json(
+            {
+                "type": "submit",
+                "src_lang": "de",
+                "mt_model": "Helsinki-NLP/opus-mt-de-en",
+                "filename": "clip.mp4",
+            }
+        )
+        ready = ws.receive_json()
+        assert ready["type"] == "ready_for_upload"
+
+        ws.send_bytes(payload)
+        # may get upload_progress
+        ws.send_json({"type": "upload_complete"})
+
+        seen_types = set()
+        job_id = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            msg = ws.receive_json()
+            seen_types.add(msg["type"])
+            if msg.get("job_id"):
+                job_id = msg["job_id"]
+            if msg["type"] in ("completed", "failed", "job_queued"):
+                if msg["type"] == "job_queued":
+                    # keep reading for progress/completed
+                    continue
+                if msg["type"] == "completed":
+                    break
+                if msg["type"] == "failed":
+                    raise AssertionError(msg)
+        assert "job_queued" in seen_types or "subscribed" in seen_types
+        assert job_id is not None
+
+    # Result still available over HTTP
+    r = client.get(f"/v1/jobs/{job_id}/result", headers={"X-API-Key": key})
+    # job may still be finishing in background thread
+    for _ in range(50):
+        r = client.get(f"/v1/jobs/{job_id}", headers={"X-API-Key": key})
+        if r.json().get("status") == "completed":
+            break
+        time.sleep(0.05)
+    r = client.get(f"/v1/jobs/{job_id}/result", headers={"X-API-Key": key})
+    assert r.status_code == 200
+    assert r.content == b"out"
+
+
+def test_websocket_rejects_bad_key(tmp_path, monkeypatch):
+    api_mod = _reload_api(tmp_path, monkeypatch)
+    from fastapi.testclient import TestClient
+
+    client = TestClient(api_mod.create_app())
+    with client.websocket_connect("/v1/ws?api_key=wrong") as ws:
+        hello = ws.receive_json()
+        assert hello["authenticated"] is False
+        ws.send_json({"type": "list_jobs"})
+        err = ws.receive_json()
+        assert err["type"] == "error"
