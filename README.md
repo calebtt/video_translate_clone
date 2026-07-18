@@ -1,96 +1,195 @@
 # Video Translation with Voice Cloning
 
-Translate videos from any language to English with voice cloning.
+Translate videos from a source language to English with **zero-shot voice cloning**.
 
-- **Faster-Whisper** - Speech-to-text
-- **HuggingFace Transformers** - Translation  
-- **Step-Audio-EditX** - Zero-shot voice cloning TTS
-- **FFmpeg** - Audio/video processing
+| Stage | Tool |
+|-------|------|
+| STT | Faster-Whisper |
+| Translation | HuggingFace seq2seq (e.g. Opus-MT) |
+| TTS / clone | Step-Audio-EditX (load-once in-process when possible) |
+| Mix | FFmpeg (+ optional `atempo` duration match) |
 
-## RunPod Setup (One-Time)
+Includes:
 
-### 1. Create a Network Volume
+- **CLI** pipeline with staged runs (`stt` / `tts` / `overlay` / `all`)
+- **HTTP job API** (upload video → poll → download result)
+- RunPod-friendly Docker image (models on a network volume)
 
-Go to [RunPod Storage](https://runpod.io/console/user/storage) → **New Network Volume**:
+---
+
+## RunPod setup (one-time)
+
+### 1. Network volume
+
+[RunPod Storage](https://runpod.io/console/user/storage) → **New Network Volume**:
 
 | Setting | Value |
 |---------|-------|
 | Name | `video-translate` |
-| Size | 50 GB |
-| Region | Same as your pods |
+| Size | 50 GB+ |
+| Region | Same as pods |
 
-### 2. Build & Push Docker Image
+### 2. Build & push image
 
 ```bash
-# Clone this repo locally
-git clone https://github.com/ctdontfollowme/video-translate-clone.git
-cd video-translate-clone
+git clone https://github.com/calebtt/video_translate_clone.git
+cd video_translate_clone
 
-# Build
-docker build --platform linux/amd64 -t ctdontfollowme/video-translate-clone:v1.0 .
-
-# Push
+docker build --platform linux/amd64 -t calebtt/video-translate-clone:v1.1 .
 docker login
-docker push ctdontfollowme/video-translate-clone:v1.0
+docker push calebtt/video-translate-clone:v1.1
 ```
 
-### 3. Create RunPod Template
-
-Go to [RunPod Templates](https://runpod.io/console/user/templates) → **New Template**:
+### 3. Template
 
 | Setting | Value |
 |---------|-------|
-| Template Name | `Video Translate Clone` |
-| Container Image | `ctdontfollowme/video-translate-clone:v1.0` |
-| Container Disk | 5 GB |
+| Container Image | `calebtt/video-translate-clone:v1.1` |
+| Container Disk | 10 GB |
 | Volume Mount Path | `/workspace` |
-| Expose HTTP Ports | `8888` |
+| Expose HTTP Ports | `8000,8888` |
 | Expose TCP Ports | `22` |
 
-### 4. First Launch
+Optional env:
 
-1. Deploy a pod with your template + Network Volume attached
-2. First boot will download models (~7GB) - takes ~10 min
-3. Models persist on volume - subsequent boots are fast (~30 sec)
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `VTCLONE_API_KEY` | (empty) | Require `X-API-Key` on API |
+| `ENABLE_API` | `1` | Start FastAPI on boot |
+| `ENABLE_JUPYTER` | `1` | Start JupyterLab |
+| `JUPYTER_TOKEN` | random | Jupyter auth token |
+| `VTCLONE_API_PORT` | `8000` | API port |
+| `VTCLONE_MAX_WORKERS` | `1` | Parallel jobs (usually 1 on one GPU) |
+
+### 4. First launch
+
+1. Deploy pod with template + network volume.
+2. First boot downloads models (~7 GB) onto the volume (~10 min).
+3. Later boots reuse models (~30 s).
 
 ---
 
-## Usage
+## HTTP API
 
-### Access JupyterLab
-Click **Connect** → **HTTP Service [Port 8888]**
+Base URL: `http://<pod-host>:8000`  
+Docs: `http://<pod-host>:8000/docs`
 
-### Translate a Video
+If `VTCLONE_API_KEY` is set, send header: `X-API-Key: <key>`.
+
+### Health
 
 ```bash
-# Upload your video to /workspace/videos/ via Jupyter
+curl http://localhost:8000/health
+```
 
+### Create a job
+
+```bash
+curl -X POST http://localhost:8000/v1/jobs \
+  -H "X-API-Key: $VTCLONE_API_KEY" \
+  -F "video=@./my_video.mp4" \
+  -F "src_lang=de" \
+  -F "mt_model=Helsinki-NLP/opus-mt-de-en"
+```
+
+Response (`202`):
+
+```json
+{
+  "id": "a1b2c3d4e5f6",
+  "status": "queued",
+  "src_lang": "de",
+  ...
+}
+```
+
+### Poll status
+
+```bash
+curl http://localhost:8000/v1/jobs/a1b2c3d4e5f6 \
+  -H "X-API-Key: $VTCLONE_API_KEY"
+```
+
+Statuses: `queued` → `running` → `completed` | `failed`.
+
+### Download result
+
+```bash
+curl -L -o translated.mp4 \
+  http://localhost:8000/v1/jobs/a1b2c3d4e5f6/result \
+  -H "X-API-Key: $VTCLONE_API_KEY"
+```
+
+Segments JSON:
+
+```bash
+curl -L -o segments.json \
+  http://localhost:8000/v1/jobs/a1b2c3d4e5f6/segments \
+  -H "X-API-Key: $VTCLONE_API_KEY"
+```
+
+### List / delete
+
+```bash
+curl http://localhost:8000/v1/jobs -H "X-API-Key: $VTCLONE_API_KEY"
+curl -X DELETE http://localhost:8000/v1/jobs/a1b2c3d4e5f6 -H "X-API-Key: $VTCLONE_API_KEY"
+```
+
+### Local API process
+
+```bash
+export PYTHONPATH=.
+export VTCLONE_JOBS_DIR=./jobs
+export VTCLONE_REPO_PATH=/path/to/Step-Audio-EditX
+export VTCLONE_MODEL_PATH=/path/to/models/Step-Audio-EditX
+export VTCLONE_TOKENIZER_PATH=/path/to/models/Step-Audio-Tokenizer
+
+pip install -r requirements.txt
+python api_server.py
+# or: uvicorn vtclone.api:app --host 0.0.0.0 --port 8000
+```
+
+---
+
+## CLI usage
+
+```bash
 python /workspace/translate.py \
   --video /workspace/videos/input.mp4 \
   --src_lang de \
   --mt_model Helsinki-NLP/opus-mt-de-en \
   --repo_path /workspace/Step-Audio-EditX \
-  --model_path /workspace/models
+  --model_path /workspace/models/Step-Audio-EditX \
+  --tokenizer_path /workspace/models/Step-Audio-Tokenizer
 ```
 
-Output: `/workspace/videos/input/translated.mp4`
+Output defaults to:
+
+```
+/workspace/videos/input/translated.mp4
+/workspace/videos/input/segments.json
+/workspace/videos/input/run_manifest.json
+```
+
+(project directory is next to the video: `<parent>/<stem>/`).
+
+### Important flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--stage` | `all` | `stt` \| `tts` \| `overlay` \| `all` |
+| `--skip_existing` | off | Reuse existing TTS wavs |
+| `--duck_gain` | `0.15` | Original audio volume (0–1) |
+| `--fix-overlaps` / `--no-fix-overlaps` | on | Repair overlapping segments |
+| `--extend-video` / `--no-extend-video` | on | Freeze-frame if audio is longer |
+| `--match-duration` / `--no-match-duration` | on | `atempo` stretch TTS into slots |
+| `--vad-filter` / `--no-vad-filter` | on | Faster-Whisper VAD |
+| `--device` | `cuda` | STT/MT device (`cuda` falls back to CPU) |
+| `--tts_fail_on_error` | off | Abort if any TTS chunk fails |
 
 ---
 
-## Arguments
-
-| Argument | Description | Example |
-|----------|-------------|---------|
-| `--video` | Input video | `/workspace/videos/input.mp4` |
-| `--src_lang` | Source language | `de`, `ru`, `fr`, `es`, `zh` |
-| `--mt_model` | Translation model | `Helsinki-NLP/opus-mt-de-en` |
-| `--repo_path` | Step-Audio-EditX | `/workspace/Step-Audio-EditX` |
-| `--model_path` | Models directory | `/workspace/models` |
-| `--stage` | Run specific stage | `stt`, `tts`, `overlay`, `all` |
-| `--skip_existing` | Skip generated TTS | flag |
-| `--duck_gain` | Original audio vol | `0.15` (0-1) |
-
-## Translation Models
+## Translation models
 
 | Language | Model |
 |----------|-------|
@@ -100,17 +199,57 @@ Output: `/workspace/videos/input/translated.mp4`
 | Spanish → English | `Helsinki-NLP/opus-mt-es-en` |
 | Chinese → English | `Helsinki-NLP/opus-mt-zh-en` |
 
+---
+
 ## Requirements
 
-- GPU: 16GB+ VRAM (RTX 4090, A100, etc.)
-- Network Volume: 50GB recommended
+- GPU: **16 GB+ VRAM** (RTX 4090, A100, etc.) for Step-Audio-EditX
+- Network volume: **50 GB** recommended
+- Step-Audio-EditX also needs its own deps (notably **vLLM**) installed on the pod — `start.sh` attempts `pip install -e` on the SAEX checkout
 
-## Updating Code
+---
 
-Just push to GitHub - the container pulls latest code on every start.
+## Layout
+
+```
+video_translate_clone/
+  vtclone/
+    pipeline.py      # orchestrator
+    stt.py           # Faster-Whisper
+    mt.py            # transformers MT
+    tts_saex.py      # load-once SAEX (+ subprocess fallback)
+    overlay.py       # FFmpeg mix + atempo
+    api.py           # FastAPI jobs
+    utils.py
+  video_translate_clone_perf.py   # CLI entry
+  api_server.py
+  start.sh
+  Dockerfile
+  requirements.txt
+```
+
+## Updating code on RunPod
+
+Push to GitHub; the container pulls on each start (`REPO_URL`).
 
 ```bash
 git add -A && git commit -m "update" && git push
 ```
 
-Then restart your pod.
+Then restart the pod (or re-pull inside `/workspace/video-translate-clone`).
+
+---
+
+## Changelog (v1.1)
+
+- Job-based **HTTP API** (`/v1/jobs`)
+- Modular package (`vtclone/`)
+- **Load-once** SAEX TTS (in-process) with subprocess fallback
+- **atempo** duration matching for better A/V alignment
+- Boolean flags fixed (`--no-fix-overlaps`, `--no-extend-video`, …)
+- Project dirs default **next to the input video**
+- Whisper **tries CUDA**, falls back to CPU
+- Safer Jupyter (token required)
+- Model download markers + huggingface-cli preferred
+- `run_manifest.json` per run
+- Correct `calebtt` image/repo names in docs
