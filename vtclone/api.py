@@ -1,26 +1,33 @@
 """
 FastAPI job API for offline video translation + voice cloning.
 
-Designed for public exposure (e.g. RunPod HTTP proxy) with API-key auth.
+Designed for public exposure (e.g. RunPod HTTP/WS proxy) with API-key auth.
 
-Auth (all /v1/* routes):
+Auth (all /v1/* routes + WebSocket):
   X-API-Key: <key>
   Authorization: Bearer <key>
   Authorization: ApiKey <key>
+  WebSocket: ?api_key= or first JSON message {"type":"auth","api_key":"..."}
 
-Endpoints:
+HTTP:
   GET  /health                  public (no secrets)
   GET  /v1/models/defaults
   POST /v1/jobs                 multipart: video file + form fields
+  POST /v1/jobs/binary          raw video body
   GET  /v1/jobs                 list jobs
   GET  /v1/jobs/{job_id}        status + metadata
   GET  /v1/jobs/{job_id}/result download translated video
   GET  /v1/jobs/{job_id}/segments download segments JSON
   DELETE /v1/jobs/{job_id}      remove job artifacts
+
+WebSocket:
+  WS   /v1/ws                   preferred client path — live progress + optional upload
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import secrets
@@ -28,11 +35,12 @@ import shutil
 import threading
 import time
 import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, DefaultDict, Dict, List, Optional, Set
 
 from fastapi import (
     Depends,
@@ -44,10 +52,13 @@ from fastapi import (
     Query,
     Request,
     UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
+from starlette.websockets import WebSocketState
 
 from .pipeline import PipelineConfig, PipelineResult, run_pipeline
 from .utils import setup_logging
@@ -143,7 +154,7 @@ DEFAULT_TOKENIZER = Path(
 DEFAULT_MT = os.environ.get("VTCLONE_MT_MODEL", "Helsinki-NLP/opus-mt-de-en")
 DEFAULT_WHISPER = os.environ.get("VTCLONE_WHISPER_MODEL", "large-v3")
 MAX_WORKERS = int(os.environ.get("VTCLONE_MAX_WORKERS", "1"))
-MAX_UPLOAD_MB = int(os.environ.get("VTCLONE_MAX_UPLOAD_MB", "2048"))
+MAX_UPLOAD_MB = int(os.environ.get("VTCLONE_MAX_UPLOAD_MB", "300"))
 CORS_ORIGINS = [
     o.strip()
     for o in os.environ.get("VTCLONE_CORS_ORIGINS", "*").split(",")
@@ -159,6 +170,11 @@ except OSError:
 _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _lock = threading.Lock()
 _jobs: Dict[str, "JobRecord"] = {}
+
+# WebSocket fan-out: job_id -> set of asyncio.Queue (one per subscriber)
+_ws_sub_lock = threading.Lock()
+_job_queues: DefaultDict[str, Set[asyncio.Queue]] = defaultdict(set)
+_global_queues: Set[asyncio.Queue] = set()
 
 
 class JobStatus(str, Enum):
@@ -191,6 +207,57 @@ class JobRecord(BaseModel):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _job_event(rec: JobRecord, event_type: str = "job_update") -> Dict[str, Any]:
+    return {
+        "type": event_type,
+        "job_id": rec.id,
+        "job": rec.model_dump(),
+        "ts": _now(),
+    }
+
+
+def _subscribe_queue(job_id: Optional[str], q: asyncio.Queue) -> None:
+    with _ws_sub_lock:
+        if job_id:
+            _job_queues[job_id].add(q)
+        else:
+            _global_queues.add(q)
+
+
+def _unsubscribe_queue(job_id: Optional[str], q: asyncio.Queue) -> None:
+    with _ws_sub_lock:
+        if job_id:
+            _job_queues.get(job_id, set()).discard(q)
+            if job_id in _job_queues and not _job_queues[job_id]:
+                del _job_queues[job_id]
+        else:
+            _global_queues.discard(q)
+
+
+def _broadcast_job(job_id: str, event: Dict[str, Any]) -> None:
+    """Thread-safe: push event to all WS queues watching this job (or all jobs)."""
+    with _ws_sub_lock:
+        targets = list(_job_queues.get(job_id, set())) + list(_global_queues)
+    for q in targets:
+        try:
+            q.put_nowait(event)
+        except Exception:
+            pass
+
+
+def _check_api_key_value(provided: Optional[str]) -> bool:
+    if not AUTH_ENABLED or not API_KEY:
+        if REQUIRE_API_KEY and not API_KEY:
+            return False
+        return True
+    if not provided:
+        return False
+    try:
+        return secrets.compare_digest(provided.strip(), API_KEY)
+    except Exception:
+        return False
 
 
 def _extract_api_key(
@@ -408,6 +475,7 @@ def _enqueue_job(
     with _lock:
         _jobs[job_id] = rec
     _save_job(rec)
+    _broadcast_job(job_id, _job_event(rec, "job_queued"))
     _executor.submit(_run_job, job_id)
     return rec
 
@@ -417,16 +485,18 @@ def create_app() -> FastAPI:
         title="Video Translate Clone API",
         description=(
             "Offline video translation with voice cloning (job-based).\n\n"
-            "**Upload a video with the request** (required):\n"
-            "- `POST /v1/jobs` as `multipart/form-data` with file field **`video`** "
-            "(alias: `file`), plus form fields like `src_lang`.\n"
-            "- `POST /v1/jobs/binary` with raw video bytes in the body and query params.\n\n"
-            "**Public auth:** send `X-API-Key: <key>` or "
-            "`Authorization: Bearer <key>` on all `/v1/*` routes.\n\n"
-            "On RunPod, expose HTTP port **8000** and use:\n"
-            "`https://<POD_ID>-8000.proxy.runpod.net`"
+            "**Preferred client path — WebSocket** `WS /v1/ws`:\n"
+            "live progress, optional in-socket video upload, push on complete.\n\n"
+            "**HTTP upload** (also supported):\n"
+            "- `POST /v1/jobs` multipart field **`video`** (alias `file`)\n"
+            "- `POST /v1/jobs/binary` raw video body\n\n"
+            "**Auth:** `X-API-Key` / `Authorization: Bearer` on HTTP; "
+            "WebSocket `?api_key=` or `{\"type\":\"auth\",\"api_key\":\"...\"}`.\n\n"
+            "RunPod: expose port **8000** → "
+            "`https://<POD_ID>-8000.proxy.runpod.net` and "
+            "`wss://<POD_ID>-8000.proxy.runpod.net/v1/ws`"
         ),
-        version="1.1.1",
+        version="1.2.0",
     )
 
     app.add_middleware(
@@ -460,6 +530,7 @@ def create_app() -> FastAPI:
             "status": "ok",
             "gpu": gpu,
             "max_workers": MAX_WORKERS,
+            "max_upload_mb": MAX_UPLOAD_MB,
             "api_key_required": bool(AUTH_ENABLED and API_KEY),
             "public_auth": "X-API-Key or Authorization: Bearer",
         }
@@ -733,6 +804,388 @@ def create_app() -> FastAPI:
         shutil.rmtree(_job_dir(job_id), ignore_errors=True)
         return {"status": "deleted", "id": job_id}
 
+    @app.websocket("/v1/ws")
+    async def jobs_websocket(
+        websocket: WebSocket,
+        api_key: Optional[str] = Query(default=None),
+    ) -> None:
+        """
+        Preferred interactive client.
+
+        Auth: `?api_key=` or first message `{"type":"auth","api_key":"..."}`.
+
+        Client → server (JSON text unless noted):
+          - `{"type":"auth","api_key":"..."}`
+          - `{"type":"ping"}`
+          - `{"type":"subscribe","job_id":"..."}`  (omit job_id = all jobs)
+          - `{"type":"unsubscribe","job_id":"..."}`
+          - `{"type":"submit","src_lang":"de","mt_model":"...","filename":"x.mp4", ...}`
+            then binary frames of the video, then
+            `{"type":"upload_complete"}`
+          - `{"type":"get_job","job_id":"..."}`
+          - `{"type":"list_jobs"}`
+
+        Server → client:
+          - `hello`, `auth_ok`, `pong`, `error`
+          - `job_queued` / `job_update` / `progress` / `completed` / `failed`
+          - `ready_for_upload` after submit
+          - `upload_progress` while receiving bytes
+        """
+        await websocket.accept()
+        out_q: asyncio.Queue = asyncio.Queue(maxsize=256)
+        subscribed: Set[Optional[str]] = set()
+        authenticated = _check_api_key_value(api_key)
+
+        # Optional upload session state
+        upload_fh = None
+        upload_path: Optional[Path] = None
+        upload_staging: Optional[Path] = None
+        upload_size = 0
+        upload_meta: Optional[Dict[str, Any]] = None
+        max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+
+        async def send_event(event: Dict[str, Any]) -> None:
+            if websocket.client_state != WebSocketState.CONNECTED:
+                return
+            await websocket.send_json(event)
+
+        async def pump_out() -> None:
+            while True:
+                event = await out_q.get()
+                try:
+                    await send_event(event)
+                except Exception:
+                    break
+
+        pump_task = asyncio.create_task(pump_out())
+
+        def sub(job_id: Optional[str]) -> None:
+            if job_id in subscribed:
+                return
+            _subscribe_queue(job_id, out_q)
+            subscribed.add(job_id)
+
+        def unsub(job_id: Optional[str]) -> None:
+            if job_id not in subscribed:
+                return
+            _unsubscribe_queue(job_id, out_q)
+            subscribed.discard(job_id)
+
+        def cleanup_upload() -> None:
+            nonlocal upload_fh, upload_path, upload_staging, upload_size, upload_meta
+            if upload_fh is not None:
+                try:
+                    upload_fh.close()
+                except Exception:
+                    pass
+                upload_fh = None
+            if upload_staging is not None:
+                shutil.rmtree(upload_staging, ignore_errors=True)
+            upload_path = None
+            upload_staging = None
+            upload_size = 0
+            upload_meta = None
+
+        try:
+            await send_event(
+                {
+                    "type": "hello",
+                    "version": "1.2.0",
+                    "auth_required": bool(AUTH_ENABLED and API_KEY),
+                    "authenticated": authenticated,
+                    "protocol": {
+                        "submit": "JSON submit → binary video chunks → upload_complete",
+                        "subscribe": "JSON subscribe for live job progress",
+                        "result": "HTTP GET /v1/jobs/{id}/result after completed",
+                    },
+                }
+            )
+
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+
+                # ---- binary: video upload chunks ----
+                if "bytes" in message and message["bytes"] is not None:
+                    if not authenticated:
+                        await send_event({"type": "error", "detail": "Not authenticated"})
+                        continue
+                    if upload_fh is None or upload_path is None:
+                        await send_event(
+                            {
+                                "type": "error",
+                                "detail": "Send {\"type\":\"submit\",...} before binary chunks",
+                            }
+                        )
+                        continue
+                    chunk = message["bytes"]
+                    upload_size += len(chunk)
+                    if upload_size > max_bytes:
+                        cleanup_upload()
+                        await send_event(
+                            {
+                                "type": "error",
+                                "detail": f"Upload exceeds {MAX_UPLOAD_MB} MB",
+                            }
+                        )
+                        continue
+                    upload_fh.write(chunk)
+                    # Throttle progress spam: every ~1 MiB boundary
+                    if upload_size == len(chunk) or upload_size % (1024 * 1024) < len(chunk):
+                        await send_event(
+                            {
+                                "type": "upload_progress",
+                                "bytes": upload_size,
+                            }
+                        )
+                    continue
+
+                # ---- text JSON ----
+                text = message.get("text")
+                if text is None:
+                    continue
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    await send_event({"type": "error", "detail": "Invalid JSON"})
+                    continue
+                if not isinstance(data, dict) or "type" not in data:
+                    await send_event(
+                        {"type": "error", "detail": "Message must be an object with type"}
+                    )
+                    continue
+
+                msg_type = data["type"]
+
+                if msg_type == "auth":
+                    if _check_api_key_value(data.get("api_key") or data.get("key")):
+                        authenticated = True
+                        await send_event({"type": "auth_ok"})
+                    else:
+                        authenticated = False
+                        await send_event({"type": "error", "detail": "Invalid API key"})
+                    continue
+
+                if msg_type == "ping":
+                    await send_event({"type": "pong", "ts": _now()})
+                    continue
+
+                if not authenticated:
+                    await send_event(
+                        {
+                            "type": "error",
+                            "detail": "Authenticate first: ?api_key= or {\"type\":\"auth\",\"api_key\":\"...\"}",
+                        }
+                    )
+                    continue
+
+                if msg_type == "subscribe":
+                    job_id = data.get("job_id")
+                    # None / missing / "" → all jobs
+                    if not job_id:
+                        job_id = None
+                    sub(job_id)
+                    await send_event({"type": "subscribed", "job_id": job_id})
+                    if job_id:
+                        with _lock:
+                            rec = _jobs.get(job_id)
+                        if rec:
+                            await send_event(_job_event(rec, "job_snapshot"))
+                        else:
+                            await send_event(
+                                {"type": "error", "detail": f"Job not found: {job_id}"}
+                            )
+                    continue
+
+                if msg_type == "unsubscribe":
+                    job_id = data.get("job_id")
+                    if not job_id:
+                        job_id = None
+                    unsub(job_id)
+                    await send_event({"type": "unsubscribed", "job_id": job_id})
+                    continue
+
+                if msg_type == "list_jobs":
+                    with _lock:
+                        jobs = sorted(
+                            (_jobs.values()),
+                            key=lambda j: j.created_at,
+                            reverse=True,
+                        )
+                    await send_event(
+                        {
+                            "type": "jobs",
+                            "jobs": [j.model_dump() for j in jobs],
+                        }
+                    )
+                    continue
+
+                if msg_type == "get_job":
+                    job_id = data.get("job_id")
+                    if not job_id:
+                        await send_event({"type": "error", "detail": "job_id required"})
+                        continue
+                    with _lock:
+                        rec = _jobs.get(job_id)
+                    if not rec:
+                        await send_event({"type": "error", "detail": "Job not found"})
+                    else:
+                        await send_event(_job_event(rec, "job_snapshot"))
+                    continue
+
+                if msg_type == "submit":
+                    if upload_fh is not None:
+                        await send_event(
+                            {
+                                "type": "error",
+                                "detail": "Upload already in progress; finish or cancel first",
+                            }
+                        )
+                        continue
+                    src_lang = (data.get("src_lang") or "").strip()
+                    if not src_lang:
+                        await send_event({"type": "error", "detail": "src_lang required"})
+                        continue
+                    filename = data.get("filename") or "input.mp4"
+                    upload_staging = JOBS_ROOT / "_staging" / uuid.uuid4().hex
+                    upload_staging.mkdir(parents=True, exist_ok=True)
+                    upload_path = upload_staging / f"upload{_suffix_from_name(filename)}"
+                    upload_fh = upload_path.open("wb")
+                    upload_size = 0
+                    upload_meta = {
+                        "src_lang": src_lang,
+                        "mt_model": data.get("mt_model") or DEFAULT_MT,
+                        "stage": data.get("stage") or "all",
+                        "whisper_model": data.get("whisper_model") or DEFAULT_WHISPER,
+                        "device": data.get("device") or "cuda",
+                        "compute_type": data.get("compute_type") or "float16",
+                        "duck_gain": float(data.get("duck_gain", 0.15)),
+                        "ref_seconds": float(data.get("ref_seconds", 10.0)),
+                        "prompt_text": data.get("prompt_text"),
+                        "skip_existing": bool(data.get("skip_existing", False)),
+                        "fix_overlaps": bool(data.get("fix_overlaps", True)),
+                        "extend_video": bool(data.get("extend_video", True)),
+                        "match_duration": bool(data.get("match_duration", True)),
+                        "vad_filter": bool(data.get("vad_filter", True)),
+                        "repo_path": data.get("repo_path"),
+                        "model_path": data.get("model_path"),
+                        "tokenizer_path": data.get("tokenizer_path"),
+                        "filename": filename,
+                    }
+                    await send_event(
+                        {
+                            "type": "ready_for_upload",
+                            "filename": filename,
+                            "max_upload_mb": MAX_UPLOAD_MB,
+                        }
+                    )
+                    continue
+
+                if msg_type == "upload_cancel":
+                    cleanup_upload()
+                    await send_event({"type": "upload_cancelled"})
+                    continue
+
+                if msg_type == "upload_complete":
+                    if upload_fh is None or upload_path is None or upload_meta is None:
+                        await send_event(
+                            {"type": "error", "detail": "No upload in progress"}
+                        )
+                        continue
+                    try:
+                        upload_fh.close()
+                    except Exception:
+                        pass
+                    upload_fh = None
+                    if upload_size == 0 or not upload_path.is_file():
+                        cleanup_upload()
+                        await send_event({"type": "error", "detail": "Empty upload"})
+                        continue
+
+                    meta = upload_meta
+                    path = upload_path
+                    size = upload_size
+                    # Keep staging until enqueue moves file
+                    upload_path = None
+                    upload_staging = None
+                    upload_meta = None
+                    upload_size = 0
+
+                    try:
+                        rec = _enqueue_job(
+                            dest=path,
+                            size=size,
+                            orig_name=meta["filename"],
+                            src_lang=meta["src_lang"],
+                            mt_model=meta["mt_model"],
+                            stage=meta["stage"],
+                            whisper_model=meta["whisper_model"],
+                            device=meta["device"],
+                            compute_type=meta["compute_type"],
+                            duck_gain=meta["duck_gain"],
+                            ref_seconds=meta["ref_seconds"],
+                            prompt_text=meta["prompt_text"],
+                            skip_existing=meta["skip_existing"],
+                            fix_overlaps=meta["fix_overlaps"],
+                            extend_video=meta["extend_video"],
+                            match_duration=meta["match_duration"],
+                            vad_filter=meta["vad_filter"],
+                            repo_path=meta["repo_path"],
+                            model_path=meta["model_path"],
+                            tokenizer_path=meta["tokenizer_path"],
+                        )
+                    except HTTPException as e:
+                        cleanup_upload()
+                        await send_event({"type": "error", "detail": e.detail})
+                        continue
+                    except Exception as e:
+                        cleanup_upload()
+                        await send_event({"type": "error", "detail": str(e)})
+                        continue
+
+                    # Auto-subscribe to this job for live progress
+                    sub(rec.id)
+                    await send_event(_job_event(rec, "job_queued"))
+                    await send_event(
+                        {
+                            "type": "subscribed",
+                            "job_id": rec.id,
+                            "note": "Auto-subscribed after submit",
+                        }
+                    )
+                    continue
+
+                await send_event(
+                    {
+                        "type": "error",
+                        "detail": f"Unknown message type: {msg_type}",
+                    }
+                )
+
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.exception("WebSocket error: %s", e)
+            try:
+                await send_event({"type": "error", "detail": str(e)})
+            except Exception:
+                pass
+        finally:
+            cleanup_upload()
+            for jid in list(subscribed):
+                unsub(jid)
+            pump_task.cancel()
+            try:
+                await pump_task
+            except Exception:
+                pass
+            try:
+                if websocket.client_state == WebSocketState.CONNECTED:
+                    await websocket.close()
+            except Exception:
+                pass
+
     return app
 
 
@@ -747,6 +1200,23 @@ def _update(job_id: str, **kwargs: Any) -> None:
         rec = JobRecord(**data)
         _jobs[job_id] = rec
     _save_job(rec)
+
+    event_type = "job_update"
+    if rec.status == JobStatus.completed:
+        event_type = "completed"
+    elif rec.status == JobStatus.failed:
+        event_type = "failed"
+    elif kwargs.get("progress_stage"):
+        event_type = "progress"
+
+    event = _job_event(rec, event_type)
+    if event_type == "progress":
+        event["stage"] = rec.progress_stage
+        event["detail"] = rec.progress_detail
+    if event_type == "completed":
+        event["result_path"] = f"/v1/jobs/{job_id}/result"
+        event["segments_path"] = f"/v1/jobs/{job_id}/segments"
+    _broadcast_job(job_id, event)
 
 
 def _run_job(job_id: str) -> None:
