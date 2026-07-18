@@ -5,8 +5,9 @@ models/
 *.safetensors
 *.onnx
 
-# Videos
+# Videos & audio
 videos/
+jobs/
 *.mp4
 *.mkv
 *.avi
@@ -19,11 +20,12 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
-
-# Environment
-.env
 .venv/
 venv/
+
+# Environment / secrets
+.env
+.vtclone_api_key
 
 # IDE
 .vscode/
@@ -32,3 +34,5 @@ venv/
 # Misc
 .DS_Store
 *.log
+run_manifest.json
+segments.json

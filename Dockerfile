@@ -3,49 +3,43 @@
 # =============================================================================
 FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
-# Install system dependencies
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsox-dev \
-    && rm -rf /var/lib/apt/lists/*
+    git-lfs \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install
 
-# Install Python dependencies for Step-Audio-EditX (filtered)
-# Exclude torch/torchaudio (in base), gradio/spaces (not needed for CLI)
-RUN pip install --no-cache-dir \
-    torchaudio==2.4.0 \
-    numpy \
-    einops \
-    transformers \
-    accelerate \
-    sentencepiece \
-    safetensors \
-    soundfile \
-    librosa \
-    scipy \
-    onnxruntime \
-    vector-quantize-pytorch \
-    vocos
+# Python deps for pipeline + API (torch is in base image)
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && pip cache purge \
+    && rm -rf /root/.cache/pip/* /tmp/requirements.txt
 
-# Install translation pipeline dependencies
-RUN pip install --no-cache-dir \
-    faster-whisper>=1.0.0 \
-    tqdm>=4.66.0 \
-    httpx>=0.27.0
+# Bundle code as fallback; start.sh still git-pulls latest when network allows
+COPY . /opt/video_translate_clone
+RUN chmod +x /opt/video_translate_clone/start.sh \
+    && ln -sf /opt/video_translate_clone/start.sh /start.sh
 
-# Clean up
-RUN pip cache purge && rm -rf /root/.cache/pip/*
-
-# Copy startup script
-COPY start.sh /start.sh
-RUN chmod +x /start.sh
-
-# Environment
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/workspace/video-translate-clone:/opt/video_translate_clone
 ENV HF_HOME=/workspace/.cache/huggingface
 ENV REPO_URL=https://github.com/calebtt/video_translate_clone.git
+ENV VTCLONE_JOBS_DIR=/workspace/jobs
+ENV VTCLONE_REPO_PATH=/workspace/Step-Audio-EditX
+ENV VTCLONE_MODEL_PATH=/workspace/models/Step-Audio-EditX
+ENV VTCLONE_TOKENIZER_PATH=/workspace/models/Step-Audio-Tokenizer
+ENV VTCLONE_API_PORT=8000
+ENV VTCLONE_REQUIRE_API_KEY=1
+ENV VTCLONE_API_KEY_FILE=/workspace/.vtclone_api_key
+ENV VTCLONE_MAX_UPLOAD_MB=300
+ENV VTCLONE_MAX_WORKERS=1
+ENV JUPYTER_TOKEN=
 
 WORKDIR /workspace
 
-EXPOSE 8888 22
+EXPOSE 8888 8000 22
 
 CMD ["/start.sh"]
